@@ -3,4 +3,16 @@ name = "svd-mmap"
 version = "0.1.0"
 authors = ["Brandon Edens <brandonedens@gmail.com>"]
 
+[lib]
+name = "svd_mmap"
+plugin = true
+
 [dependencies]
+aster = "0.26.1"
+inflections = "1.0.0"
+quasi = { git = "https://github.com/brandonedens/quasi.git", branch="string-totoken" }
+quasi_macros = { git = "https://github.com/serde-rs/quasi.git" }
+svd = { git = "https://github.com/japaric/svd" }
+
+[dev-dependencies]
+volatile_cell = {git = "https://github.com/hackndev/zinc"}
