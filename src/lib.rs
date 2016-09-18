@@ -182,6 +182,16 @@ pub fn gen_device(cx: &mut ExtCtxt, device: &Device) -> Vec<P<syntax::ast::Item>
     v
 }
 
+/// Print to standard output linker information for the device.
+pub fn gen_link_mem(device: &Device) {
+    for periph in device.peripherals.iter() {
+        let name = String::from(LINK_MEM_PREFIX.to_owned() +
+                                &device.name + "_" +
+                                periph.name.as_str()).to_snake_case();
+        println!("{} = 0x{:08x}", name, periph.base_address);
+    }
+}
+
 /// Generate definition of a peripheral.
 fn gen_periph(cx: &ExtCtxt, periph: &Peripheral) -> Vec<P<syntax::ast::Item>> {
     let mut v = Vec::new();
@@ -516,6 +526,18 @@ mod tests {
         for item in items {
             println!("{}", item_to_string(&item));
         }
+    }
+
+    #[test]
+    fn test_gen_link_mem() {
+        let svd_filename = "/tmp/STM32L4x6.svd";
+        let mut svd_file = File::open(svd_filename).unwrap();
+        let mut s = String::new();
+        svd_file.read_to_string(&mut s).unwrap();
+
+        // Generate SVD device data from SVD XML.
+        let dev = Device::parse(&s);
+        super::gen_link_mem(&dev);
     }
 
     #[test]
