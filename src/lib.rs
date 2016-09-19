@@ -221,7 +221,7 @@ fn gen_periph(cx: &ExtCtxt, periph: &Peripheral) -> Vec<P<syntax::ast::Item>> {
                 let pad_name = builder.id(format!("_pad{}", pad_num));
                 pad_num += 1;
 
-                let delta = reg.address_offset - offset;
+                let delta = (reg.address_offset - offset) as usize;
                 let tts = quote_tokens!(&cx, $pad_name: [u8; $delta],);
                 reg_vec.push(tts);
             }
