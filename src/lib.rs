@@ -158,7 +158,7 @@ pub fn gen_device(cx: &mut ExtCtxt, device: &Device) -> Vec<P<syntax::ast::Item>
                 }
             }
 
-            let periph_item = quote_item!(&cx, mod $periph_mod_name {
+            let periph_item = quote_item!(&cx, pub mod $periph_mod_name {
                 use volatile_cell::VolatileCell;
                 use core::ops::Drop;
 
@@ -173,7 +173,7 @@ pub fn gen_device(cx: &mut ExtCtxt, device: &Device) -> Vec<P<syntax::ast::Item>
 
     // Create module housing the hardware.
     let dev_name =  builder.id(device.name.to_snake_case());
-    let dev_item = quote_item!(&cx, mod $dev_name {
+    let dev_item = quote_item!(&cx, pub mod $dev_name {
         $peripheral_items
     }).unwrap();
 
