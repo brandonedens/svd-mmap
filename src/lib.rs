@@ -483,13 +483,13 @@ mod tests {
     use std::io::prelude::*;
     use svd::{Access, BitRange, Device, Field, Peripheral, Register};
     use syntax::codemap;
-    use syntax::ext::base::{DummyMacroLoader, ExtCtxt};
+    use syntax::ext::base::{DummyResolver, ExtCtxt};
     use syntax::ext::expand;
     use syntax::parse;
     use syntax::print::pprust::item_to_string;
 
     fn make_ext_ctxt<'a>(sess: &'a parse::ParseSess,
-                         macro_loader: &'a mut DummyMacroLoader) -> ExtCtxt<'a> {
+                         macro_loader: &'a mut DummyResolver) -> ExtCtxt<'a> {
         let info = codemap::ExpnInfo {
             call_site: codemap::DUMMY_SP,
             callee: codemap::NameAndSpan {
@@ -519,7 +519,7 @@ mod tests {
         let dev = Device::parse(&s);
 
         let sess = parse::ParseSess::new();
-        let mut macro_loader = DummyMacroLoader;
+        let mut macro_loader = DummyResolver;
         let mut cx = make_ext_ctxt(&sess, &mut macro_loader);
 
         let items = super::gen_device(&mut cx, &dev);
@@ -615,7 +615,7 @@ mod tests {
         };
 
         let sess = parse::ParseSess::new();
-        let mut macro_loader = DummyMacroLoader;
+        let mut macro_loader = DummyResolver;
         let cx = make_ext_ctxt(&sess, &mut macro_loader);
 
         let items = super::gen_periph(&cx, &periph);
@@ -671,7 +671,7 @@ mod tests {
         };
 
         let sess = parse::ParseSess::new();
-        let mut macro_loader = DummyMacroLoader;
+        let mut macro_loader = DummyResolver;
         let cx = make_ext_ctxt(&sess, &mut macro_loader);
 
         let items = super::gen_reg_field_impl(&cx, &reg);
