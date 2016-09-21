@@ -133,6 +133,7 @@ pub fn gen_device(cx: &mut ExtCtxt, device: &Device) -> Vec<P<syntax::ast::Item>
                 periph.group_name.as_ref().unwrap_or(&periph_name.to_owned()).to_pascal_case());
             let periph_name = builder.id(periph.name.to_snake_case());
 
+            // Build the links to memory mapped registers.
             let mut statics = Vec::new();
             let item = quote_item!(&cx,
                                    #[allow(dead_code)]
