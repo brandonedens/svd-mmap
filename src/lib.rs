@@ -14,7 +14,6 @@
 //! Provide a Rust macro for converting ARM CMSIS SVD description into Rust for accessing the
 //! specified hardware.
 
-// TODO remove
 #![feature(plugin, plugin_registrar, rustc_private)]
 #![plugin(quasi_macros)]
 
@@ -43,43 +42,519 @@ use syntax::util::small_vector::SmallVector;
 
 const LINK_MEM_PREFIX: &'static str = "mmap_";
 
-// TODO combine these two functions.
-fn read_only(field: &Field, reg: &Register) -> bool {
-    if let Some(access) = field.access.as_ref() {
-        return *access == Access::ReadOnly;
-    }
+trait GenField {
+    /// Generate getter impl.
+    fn gen_get(&self, cx: &ExtCtxt, register: &Register) -> Vec<P<syntax::ast::Item>>;
 
-    if let Some(access) = reg.access.as_ref() {
-        return *access == Access::ReadOnly;
-    }
+    /// Generate type of the field.
+    fn gen_type(&self) -> syntax::ptr::P<syntax::ast::Ty>;
 
-    return false;
+    /// Generate the type definition for the field that has enumerated values.
+    fn gen_type_def(&self, cx: &ExtCtxt) -> Option<P<syntax::ast::Item>>;
+
+    /// Generate setter impl.
+    fn gen_update(&self, cx: &ExtCtxt, register: &Register) -> Vec<P<syntax::ast::Item>>;
 }
 
-fn write_only(field: &Field, reg: &Register) -> bool {
-    if let Some(access) = field.access.as_ref() {
-        return *access == Access::WriteOnly;
+impl GenField for Field {
+
+    /// Generate struct representation of register field getter in the form:
+    ///
+    /// ```rust
+    /// #[allow(dead_code, missing_docs)]
+    /// impl Cr {
+    ///     #[inline(always)]
+    ///     pub fn rx(&self) -> bool {
+    ///         CrGet::new(self).rx()
+    ///     }
+    /// }
+    ///
+    /// #[allow(dead_code, missing_docs)]
+    /// impl CrGet {
+    ///     #[inline(always)]
+    ///     pub fn rx(&self) -> CrGet {
+    ///         (self.value >> 11) & 1 != 0
+    ///     }
+    /// }
+    /// ```
+    fn gen_get(&self, cx: &ExtCtxt, register: &Register) -> Vec<P<syntax::ast::Item>> {
+        let builder    = aster::AstBuilder::new();
+        let field_name = builder.id(self.name.to_snake_case());
+        let field_ty   = self.gen_type();
+        let bit_offset = self.bit_range.offset;
+        let bit_width  = self.bit_range.width;
+
+        let reg_name_get = register.getter_name();
+        let reg_type_name = register.type_name();
+
+        let mut v = Vec::new();
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        impl $reg_type_name {
+                            #[inline(always)]
+                            pub fn $field_name(&self) -> $field_ty {
+                                $reg_name_get::new(self).$field_name()
+                            }
+                        }).unwrap());
+
+        v.push(
+            if let Some(enum_vals) = self.enumerated_values.as_ref() {
+                let keys = enum_vals.values.iter()
+                    .map(|x| builder.id(x.name.to_pascal_case()))
+                    .collect::<Vec<_>>().into_iter();
+                let vals = enum_vals.values.iter()
+                    .map(|x| x.value)
+                    .collect::<Vec<_>>().into_iter();
+
+                let ref name = enum_vals.name.as_ref().unwrap_or(&self.name);
+                let enum_name = builder.id(name.to_pascal_case());
+
+                quote_item!(&cx,
+                            #[allow(dead_code, missing_docs)]
+                            impl $reg_name_get {
+                                #[inline(always)]
+                                pub fn $field_name(&self) -> $field_ty {
+                                    match (self.value >> $bit_offset) & $bit_width {
+                                        $($vals => ::core::option::Option::Some($enum_name::$keys)),*,
+                                        _ => ::core::option::Option::None,
+                                    }.unwrap()
+                                }
+                            }).unwrap()
+
+            } else if self.bit_range.width == 1 {
+                quote_item!(&cx,
+                            #[allow(dead_code, missing_docs)]
+                            impl $reg_name_get {
+                                #[inline(always)]
+                                pub fn $field_name(&self) -> $field_ty {
+                                    (self.value >> $bit_offset) & $bit_width != 0
+                                }
+                            }).unwrap()
+
+            } else {
+                quote_item!(&cx,
+                            #[allow(dead_code, missing_docs)]
+                            impl $reg_name_get {
+                                #[inline(always)]
+                                pub fn $field_name(&self) -> $field_ty {
+                                    ((self.value >> $bit_offset) & $bit_width) as $field_ty
+                                }
+                            }).unwrap()
+            });
+        v
     }
 
-    if let Some(access) = reg.access.as_ref() {
-        return *access == Access::WriteOnly;
+    /// Generate a type for this field.
+    ///
+    /// A type could be bool, u8, u16, or some enum like Parity depending upon the bit width and
+    /// potential existence of enumerated values.
+    fn gen_type(&self) -> syntax::ptr::P<syntax::ast::Ty> {
+        let builder = aster::AstBuilder::new();
+
+        if let Some(vals) = self.enumerated_values.as_ref() {
+            let ref name = vals.name.as_ref().unwrap_or(&self.name);
+            builder.ty().id(name.to_pascal_case())
+        } else {
+            match self.bit_range.width {
+                1 => builder.ty().bool(),
+                2...8 => builder.ty().u8(),
+                9...16 => builder.ty().u16(),
+                17...32 => builder.ty().u32(),
+                33...64 => builder.ty().u64(),
+                _ => panic!("Unknown bit width"),
+            }
+        }
     }
 
-    return false;
+    /// Generate a type for this field if applicable in the form of:
+    ///
+    /// ```rust
+	/// #[derive(PartialEq)]
+	/// #[allow(dead_code, missing_docs)]
+	/// #[repr(u32)]
+	/// pub enum Parity {
+	///     None = 0,
+	///     Even = 2,
+	///     Odd = 3,
+	/// }
+    /// ```
+    fn gen_type_def(&self, cx: &ExtCtxt) -> Option<P<syntax::ast::Item>> {
+		if self.enumerated_values.is_none() {
+            return None;
+        }
+
+        let builder = aster::AstBuilder::new();
+        let enum_vals = self.enumerated_values.as_ref().unwrap();
+        let ref name = enum_vals.name.as_ref().unwrap_or(&self.name);
+        let name = builder.id(name.to_pascal_case());
+
+        let keys = enum_vals.values.iter()
+            .map(|x| builder.id(x.name.to_pascal_case()))
+            .collect::<Vec<_>>().into_iter();
+        let vals = enum_vals.values.iter()
+            .map(|x| x.value)
+            .collect::<Vec<_>>().into_iter();
+
+        Some(quote_item!(&cx,
+                         #[derive(PartialEq)]
+                         #[allow(dead_code, missing_docs)]
+                         #[repr(u32)]
+                         pub enum $name {
+                             $($keys = $vals),*
+                         }).unwrap())
+    }
+
+    /// Generate struct representation of register field update in the form of:
+    ///
+    /// ```rust
+    /// impl Cr {
+    ///     #[inline(always)]
+    ///     pub fn set_rx<'a>('a self, new_value: bool) -> CrUpdate<'a> {
+    ///         let mut setter: CrUpdate = CrUpdate::new(self);
+    ///         setter.set_rx(new_value);
+    ///         setter
+    ///     }
+    /// }
+    ///
+    /// impl<'a> CrUpdate<'a> {
+    ///     #[inline(always)]
+    ///     pub fn set_rx<'b>(&'b mut self, new_value: bool) -> &'b mut CrUpdate<'a> {
+    ///         self.value = (self.value & !(1 << 11)) |
+    ///             ((new_value as u32) & 1) << 11;
+    ///         self.mask |= 1 << 11;
+    ///         self
+    ///     }
+    /// }
+    /// ```
+    fn gen_update(&self, cx: &ExtCtxt, register: &Register) -> Vec<P<syntax::ast::Item>> {
+        let builder    = aster::AstBuilder::new();
+        let field_name = builder.id("set_".to_string() + &self.name.to_snake_case());
+        let field_ty   = self.gen_type();
+        let bit_offset = self.bit_range.offset;
+        let bit_width  = self.bit_range.width;
+
+        let reg_name_update = register.updater_name();
+        let reg_type_name = register.type_name();
+
+        let mut v = Vec::new();
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        impl $reg_type_name {
+                            #[inline(always)]
+                            pub fn $field_name<'a>(&'a self, new_value: $field_ty) -> $reg_name_update<'a> {
+                                let mut setter: $reg_name_update = $reg_name_update::new(self);
+                                setter.$field_name(new_value);
+                                setter
+                            }
+                        }
+                       ).unwrap());
+
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        impl<'a> $reg_name_update<'a> {
+                            #[inline(always)]
+                            pub fn $field_name<'b>(&'b mut self, new_value: $field_ty) -> &'b mut $reg_name_update<'a> {
+                                self.value = (self.value & !($bit_width << $bit_offset)) |
+                                    ((new_value as u32) & $bit_width) << $bit_offset;
+                                self.mask |= $bit_width << $bit_offset;
+                                self
+                            }
+                        }).unwrap());
+        v
+    }
 }
 
-fn field_size_to_ty(field: &Field) -> syntax::ptr::P<syntax::ast::Ty> {
-    let builder = aster::AstBuilder::new();
+trait GenReg {
+    /// Generate register memory map information (including fields).
+    fn gen_mmap(&self, cx: &ExtCtxt) -> Vec<P<syntax::ast::Item>>;
 
-    let field_ty = match field.bit_range.width {
-        1 => builder.ty().bool(),
-        2...8 => builder.ty().u8(),
-        9...16 => builder.ty().u16(),
-        17...32 => builder.ty().u32(),
-        33...64 => builder.ty().u64(),
-        _ => panic!("Unknown bit width"),
-    };
-    field_ty
+    /// Generate register constants information.
+    fn gen_const(&self, cx: &ExtCtxt) -> Vec<P<syntax::ast::Item>>;
+
+    // Generate getter information.
+    fn gen_getter(&self, cx: &ExtCtxt) -> Vec<P<syntax::ast::Item>>;
+
+    // Generate updater information.
+    fn gen_updater(&self, cx: &ExtCtxt) -> Vec<P<syntax::ast::Item>>;
+
+    /// Generate getter name.
+    fn getter_name(&self) -> ast::Ident;
+
+    /// Generate type name.
+    fn type_name(&self) -> ast::Ident;
+
+    /// Generate updater name.
+    fn updater_name(&self) -> ast::Ident;
+
+}
+
+impl GenReg for Register {
+
+    /// Generate all of the Rust code needed to interface to this regster.
+    fn gen_mmap(&self, cx: &ExtCtxt) -> Vec<P<syntax::ast::Item>> {
+        let mut v = Vec::new();
+
+        // First we generate constant software associated with all registers.
+        v.append(&mut self.gen_const(&cx));
+
+        if self.access != Some(Access::WriteOnly) {
+            // Now we generate Get specific software.
+            v.append(&mut self.gen_getter(&cx));
+        }
+
+        if self.access != Some(Access::ReadOnly) {
+            // Now we generate Update specific software.
+            v.append(&mut self.gen_updater(&cx));
+        }
+
+        // Begin generating field information.
+        if let Some(fields) = self.fields.as_ref() {
+            // Generate the field's type definitions if necessary.
+            v.append(&mut fields.iter()
+                     .filter_map(|x| x.gen_type_def(&cx))
+                     .collect::<Vec<_>>());
+
+            if self.access != Some(Access::WriteOnly) {
+                // For each of the register's fields we generate the field's getter.
+                v.append(&mut
+                         fields.iter()
+                         .filter(|x| x.access != Some(Access::WriteOnly))
+                         .flat_map(|x| x.gen_get(&cx, self))
+                         .collect::<Vec<_>>());
+            }
+
+            if self.access != Some(Access::ReadOnly) {
+                // and updater.
+                v.append(&mut
+                         fields.iter()
+                         .filter(|x| x.access != Some(Access::ReadOnly))
+                         .flat_map(|x| x.gen_update(&cx, self))
+                         .collect::<Vec<_>>());
+            }
+        }
+        v
+    }
+
+    /// Generate all of the constant register details.
+    ///
+    /// The result should look like:
+    ///
+    /// ```rust
+    /// #[allow(dead_code), missing_docs)]
+    /// #[repr(C)]
+    /// pub struct Cr {
+    ///     value: VolatileCell<u32>,
+    /// }
+    /// ```
+    fn gen_const(&self, cx: &ExtCtxt) -> Vec<P<syntax::ast::Item>> {
+        let mut v = Vec::new();
+
+        let reg_type_name = self.type_name();
+
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        #[repr(C)]
+                        pub struct $reg_type_name {
+                            value: VolatileCell<u32>,
+                        }).unwrap());
+
+        v
+    }
+
+    /// Generate all of the constant register details for getters.
+    ///
+    /// The result should look like:
+    ///
+    /// ```rust
+    /// #[allow(dead_code), missing_docs)]
+    /// impl Cr {
+    ///     #[inline(always)]
+    ///     pub fn get(&self) -> CrGet {
+    ///         CrGet::new(self)
+    ///     }
+    /// }
+    ///
+    /// #[allow(dead_code), missing_docs)]
+    /// #[derive(Clone)]
+    /// pub struct CrGet {
+    ///     value: u32,
+    /// }
+    ///
+    /// #[allow(dead_code), missing_docs)]
+    /// #[derive(Clone)]
+    /// impl CrGet {
+    ///     #[inline(always)]
+    ///     pub fn new(reg: Cr) -> CrGet {
+    ///         CrGet { value: reg.value.get() }
+    ///     }
+    /// }
+    /// ```
+    fn gen_getter(&self, cx: &ExtCtxt) -> Vec<P<syntax::ast::Item>> {
+        let mut v = Vec::new();
+        let reg_type_name = self.type_name();
+        let reg_name_get = self.getter_name();
+
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        #[derive(Clone)]
+                        pub struct $reg_name_get {
+                            value: u32,
+                        }).unwrap());
+
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        impl $reg_type_name {
+                            #[inline(always)]
+                            pub fn get(&self) -> $reg_name_get {
+                                $reg_name_get::new(self)
+                            }
+                        }).unwrap());
+
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        impl $reg_name_get {
+                            #[inline(always)]
+                            pub fn new(reg: &$reg_type_name) -> $reg_name_get {
+                                $reg_name_get { value: reg.value.get() }
+                            }
+                        }).unwrap());
+        v
+    }
+
+    /// Generate all of the constant register details for getters.
+    ///
+    /// The result should look like:
+    ///
+    /// ```rust
+    /// #[allow(dead_code), missing_docs)]
+    /// impl Cr {
+    ///     #[inline(always)]
+    ///     pub fn ignoring_state(&self) -> CrUpdate {
+    ///         CrUpdate::new_ignoring_state(self)
+    ///     }
+    /// }
+    ///
+    /// #[allow(dead_code), missing_docs)]
+    /// pub struct CrUpdate<'a> {
+    ///     value: u32,
+    ///     mask: u32,
+    ///     write_only: bool,
+    ///     reg: &'a Cr,
+    /// }
+    ///
+    /// TODO is the clear mask correct?
+    /// #[allow(dead_code), missing_docs)]
+    /// impl<'a> Drop for CrUpdate<'a> {
+    ///     #[inline(always)]
+    ///     fn drop(&mut self) {
+    ///         let clear_mask: u32 = 1u32 as u32;
+    ///         if self.mask != 0 {
+    ///             let v: u32 =
+    ///                 if self.write_only { 0 } else { self.reg.value.get() } &
+    ///                     !clear_mask & !self.mask;
+    ///             self.reg.value.set(self.value | v);
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// #[allow(dead_code), missing_docs)]
+    /// impl<'a> CrUpdate<'a> {
+    ///     #[inline(always)]
+    ///     pub fn new(reg: &'a Cr) -> CrUpdate<'a> {
+    ///         CrUpdate { value: 0, mask: 0, write_only: false, reg: reg }
+    ///     }
+    ///     #[inline(always)]
+    ///     pub fn new_ignoring_state(reg: &'a Cr) -> CrUpdate<'a> {
+    ///         CrUpdate { value: 0, mask: 0, write_only: true, reg: reg }
+    ///     }
+    /// }
+    /// ```
+    fn gen_updater(&self, cx: &ExtCtxt) -> Vec<P<syntax::ast::Item>> {
+        let mut v = Vec::new();
+        let reg_type_name = self.type_name();
+        let reg_name_update = self.updater_name();
+
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        pub struct $reg_name_update<'a> {
+                            value: u32,
+                            mask: u32,
+                            write_only: bool,
+                            reg: &'a $reg_type_name,
+                        }).unwrap());
+
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        impl $reg_type_name {
+                            #[inline(always)]
+                            pub fn ignoring_state(&self) -> $reg_name_update {
+                                $reg_name_update::new_ignoring_state(self)
+                            }
+                        }).unwrap());
+
+
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        impl<'a> Drop for $reg_name_update<'a> {
+                            #[inline(always)]
+                            fn drop(&mut self) {
+                                let clear_mask: u32 = 1u32 as u32;
+                                if self.mask != 0 {
+                                    let v: u32 =
+                                        if self.write_only { 0 } else { self.reg.value.get() } &
+                                            !clear_mask & !self.mask;
+                                    self.reg.value.set(self.value | v);
+                                }
+                            }
+                        }).unwrap());
+
+        v.push(
+            quote_item!(&cx,
+                        #[allow(dead_code, missing_docs)]
+                        impl<'a> $reg_name_update<'a> {
+                            #[inline(always)]
+                            pub fn new(reg: &'a $reg_type_name) -> $reg_name_update<'a> {
+                                $reg_name_update {value: 0, mask: 0, write_only: false, reg: reg}
+                            }
+
+                            #[inline(always)]
+                            pub fn new_ignoring_state(reg: &'a $reg_type_name) -> $reg_name_update<'a> {
+                                $reg_name_update {value: 0, mask: 0, write_only: true, reg: reg}
+                            }
+                        }).unwrap());
+        v
+    }
+
+    /// Generate getter name.
+    fn getter_name(&self) -> ast::Ident {
+        let builder = aster::AstBuilder::new();
+        let name = self.name.to_pascal_case();
+        builder.id(name.to_owned() + "Get")
+    }
+
+    /// Generate type name.
+    fn type_name(&self) -> ast::Ident {
+        let builder = aster::AstBuilder::new();
+        let name = self.name.to_pascal_case();
+        builder.id(name.to_owned())
+    }
+
+    /// Generate updater name.
+    fn updater_name(&self) -> ast::Ident {
+        let builder = aster::AstBuilder::new();
+        let name = self.name.to_pascal_case();
+        builder.id(name.to_owned() + "Update")
+    }
 }
 
 /// Generate complete memory mapped hardware definition in Rust for device.
@@ -131,7 +606,7 @@ pub fn gen_device(cx: &mut ExtCtxt, device: &Device) -> Vec<P<syntax::ast::Item>
             let link_name = String::from(LINK_MEM_PREFIX.to_owned() + &device.name + "_" + &periph.name).to_snake_case();
             let periph_ty = builder.id(
                 periph.group_name.as_ref().unwrap_or(&periph_name.to_owned()).to_pascal_case());
-            let periph_name = builder.id(periph.name.to_snake_case());
+            let periph_name = builder.id(periph.name.to_constant_case());
 
             // Build the links to memory mapped registers.
             let mut statics = Vec::new();
@@ -148,7 +623,7 @@ pub fn gen_device(cx: &mut ExtCtxt, device: &Device) -> Vec<P<syntax::ast::Item>
                         String::from(LINK_MEM_PREFIX.to_owned() +
                                      &device.name + "_" +
                                      periph_name).to_snake_case();
-                    let periph_name = builder.id(periph_name.to_snake_case());
+                    let periph_name = builder.id(periph_name.to_constant_case());
                     let item = quote_item!(&cx,
                                            #[allow(dead_code)]
                                            extern {
@@ -247,178 +722,10 @@ fn gen_periph(cx: &ExtCtxt, periph: &Peripheral) -> Vec<P<syntax::ast::Item>> {
 
     if let Some(regs) = periph.registers.as_ref() {
         for reg in regs {
-            v.append(&mut gen_reg_field_impl(cx, reg));
+            v.append(&mut reg.gen_mmap(cx));
         }
     }
 
-    v
-}
-
-/// Generate implementation items for each field in register.
-fn gen_reg_field_impl(cx: &ExtCtxt, reg: &Register) -> Vec<P<syntax::ast::Item>> {
-    let mut v = Vec::new();
-    let builder = aster::AstBuilder::new();
-
-    let reg_type_name = builder.id(reg.name.to_pascal_case());
-    let reg_name_get = builder.id(reg.name.to_pascal_case() + "Get");
-    let reg_name_update = builder.id(reg.name.to_pascal_case() + "Update");
-
-    let item = quote_item!(&cx,
-                           #[allow(dead_code, missing_docs)]
-                           #[repr(C)]
-                           pub struct $reg_type_name {
-                                value: VolatileCell<u32>,
-                           }).unwrap();
-    v.push(item);
-
-    let item = quote_item!(&cx,
-                           #[allow(dead_code, missing_docs)]
-                           impl $reg_type_name {
-
-                               #[inline(always)]
-                               pub fn get(&self) -> $reg_name_get {
-                                   $reg_name_get::new(self)
-                               }
-
-                               #[inline(always)]
-                               pub fn ignoring_state(&self) -> $reg_name_update {
-                                   $reg_name_update::new_ignoring_state(self)
-                               }
-                           }).unwrap();
-    v.push(item);
-
-    let item = quote_item!(&cx,
-                           #[allow(dead_code, missing_docs)]
-                           #[derive(Clone)]
-                           pub struct $reg_name_get {
-                               value: u32,
-                           }).unwrap();
-    v.push(item);
-
-    let item = quote_item!(&cx,
-                           #[allow(dead_code, missing_docs)]
-                           impl $reg_name_get {
-                               #[inline(always)]
-                               pub fn new(reg: &$reg_type_name) -> $reg_name_get {
-                                   $reg_name_get { value: reg.value.get() }
-                               }
-                           }).unwrap();
-    v.push(item);
-
-    let item = quote_item!(&cx,
-                           #[allow(dead_code, missing_docs)]
-                           pub struct $reg_name_update<'a> {
-                               value: u32,
-                               mask: u32,
-                               write_only: bool,
-                               reg: &'a $reg_type_name,
-                           }).unwrap();
-    v.push(item);
-
-    let item = quote_item!(&cx,
-        #[allow(dead_code, missing_docs)]
-        impl<'a> Drop for $reg_name_update<'a> {
-            #[inline(always)]
-            fn drop(&mut self) {
-                let clear_mask: u32 = 1u32 as u32;
-                if self.mask != 0 {
-                    let v: u32 =
-                        if self.write_only { 0 } else { self.reg.value.get() } &
-                            !clear_mask & !self.mask;
-                    self.reg.value.set(self.value | v);
-                }
-            }
-        }).unwrap();
-    v.push(item);
-
-    let item = quote_item!(&cx,
-        #[allow(dead_code, missing_docs)]
-        impl<'a> $reg_name_update<'a> {
-            #[inline(always)]
-            pub fn new(reg: &'a $reg_type_name) -> $reg_name_update<'a> {
-                $reg_name_update {value: 0, mask: 0, write_only: false, reg: reg}
-            }
-
-            #[inline(always)]
-            pub fn new_ignoring_state(reg: &'a $reg_type_name) -> $reg_name_update<'a> {
-                $reg_name_update {value: 0, mask: 0, write_only: true, reg: reg}
-            }
-        }).unwrap();
-    v.push(item);
-
-    if let Some(fields) = reg.fields.as_ref() {
-        for field in fields {
-            let field_ty = field_size_to_ty(field);
-            let bit_offset = field.bit_range.offset;
-            let bit_width = field.bit_range.width;
-
-            if !read_only(field, reg) {
-                let field_name = builder.id("set_".to_string() + &field.name.to_snake_case());
-
-                let item = quote_item!(&cx,
-                                       #[allow(dead_code, missing_docs)]
-                                       impl $reg_type_name {
-                                           #[inline(always)]
-                                           pub fn $field_name<'a>(&'a self, new_value: $field_ty) -> $reg_name_update<'a> {
-                                               let mut setter: $reg_name_update = $reg_name_update::new(self);
-                                               setter.$field_name(new_value);
-                                               setter
-                                           }
-                                       }
-                                      ).unwrap();
-                v.push(item);
-
-                let item = quote_item!(&cx,
-                    #[allow(dead_code, missing_docs)]
-                    impl<'a> $reg_name_update<'a> {
-                        #[inline(always)]
-                        pub fn $field_name<'b>(&'b mut self, new_value: $field_ty) -> &'b mut $reg_name_update<'a> {
-                            self.value = (self.value & !($bit_width << $bit_offset)) |
-                                ((new_value as u32) & $bit_width) << $bit_offset;
-                            self.mask |= $bit_width << $bit_offset;
-                            self
-                        }
-                    }).unwrap();
-                v.push(item);
-            }
-
-            if !write_only(field, reg) {
-                let field_name = builder.id(field.name.to_snake_case());
-                let item = quote_item!(&cx,
-                                       #[allow(dead_code, missing_docs)]
-                                       impl $reg_type_name {
-                                           #[inline(always)]
-                                           pub fn $field_name(&self) -> $field_ty {
-                                               $reg_name_get::new(self).$field_name()
-                                           }
-                                       }
-                                      ).unwrap();
-                v.push(item);
-
-                if field.bit_range.width == 1 {
-                    let item = quote_item!(&cx,
-                                           #[allow(dead_code, missing_docs)]
-                                           impl $reg_name_get {
-                                               #[inline(always)]
-                                               pub fn $field_name(&self) -> $field_ty {
-                                                   (self.value >> $bit_offset) & $bit_width != 0
-                                               }
-                                           }).unwrap();
-                    v.push(item);
-                } else {
-                    let item = quote_item!(&cx,
-                                           #[allow(dead_code, missing_docs)]
-                                           impl $reg_name_get {
-                                               #[inline(always)]
-                                               pub fn $field_name(&self) -> $field_ty {
-                                                   ((self.value >> $bit_offset) & $bit_width) as $field_ty
-                                               }
-                                           }).unwrap();
-                    v.push(item);
-                }
-            }
-        }
-    }
     v
 }
 
@@ -479,15 +786,17 @@ pub fn macro_svd_mmap(cx: &mut ExtCtxt,
 #[cfg(test)]
 mod tests {
 
+    use aster::AstBuilder;
     use aster::name::ToName;
     use std::fs::File;
     use std::io::prelude::*;
-    use svd::{Access, BitRange, Device, Field, Peripheral, Register};
+    use svd::{Access, BitRange, Device, EnumeratedValue, EnumeratedValues, Field, Peripheral, Register};
     use syntax::codemap;
     use syntax::ext::base::{DummyResolver, ExtCtxt};
     use syntax::ext::expand;
     use syntax::parse;
     use syntax::print::pprust::item_to_string;
+    use super::{GenField, GenReg};
 
     fn make_ext_ctxt<'a>(sess: &'a parse::ParseSess,
                          macro_loader: &'a mut DummyResolver) -> ExtCtxt<'a> {
@@ -675,9 +984,278 @@ mod tests {
         let mut macro_loader = DummyResolver;
         let cx = make_ext_ctxt(&sess, &mut macro_loader);
 
-        let items = super::gen_reg_field_impl(&cx, &reg);
+        let items = reg.gen_mmap(&cx);
         for item in items {
             println!("{}", item_to_string(&item));
         }
+    }
+
+    #[test]
+    fn test_field_gen_get() {
+        let register = Register {
+            name: "CR".to_owned(),
+            description: "Control register".to_owned(),
+            address_offset: 0x00,
+            size: None,
+            access: None,
+            reset_value: None,
+            reset_mask: None,
+            fields: Some(vec![
+                         Field {
+                             name: "RX".to_owned(),
+                             description: Some("Receive enabled".to_owned()),
+                             bit_range: BitRange {
+                                 offset: 11,
+                                 width: 1,
+                             },
+                             access: Some(Access::ReadWrite),
+                             enumerated_values: None,
+                         }])
+        };
+        let ref field = register.fields.as_ref().unwrap().get(0).unwrap();
+
+        let sess = parse::ParseSess::new();
+        let mut macro_loader = DummyResolver;
+        let cx = make_ext_ctxt(&sess, &mut macro_loader);
+
+        let items = field.gen_get(&cx, &register);
+        assert_eq!(item_to_string(&items.get(1).unwrap()),
+r"impl CrGet {
+    #[inline(always)]
+    pub fn rx(&self) -> bool { (self.value >> 11u32) & 1u32 != 0 }
+}");
+    }
+
+    #[test]
+    fn test_field_gen_update() {
+
+        let register = Register {
+            name: "CR".to_owned(),
+            description: "Control register".to_owned(),
+            address_offset: 0x00,
+            size: None,
+            access: None,
+            reset_value: None,
+            reset_mask: None,
+            fields: Some(vec![
+                         Field {
+                             name: "RX".to_owned(),
+                             description: Some("Receive enabled".to_owned()),
+                             bit_range: BitRange {
+                                 offset: 11,
+                                 width: 1,
+                             },
+                             access: Some(Access::ReadWrite),
+                             enumerated_values: None,
+                         }])
+        };
+        let ref field = register.fields.as_ref().unwrap().get(0).unwrap();
+
+        let sess = parse::ParseSess::new();
+        let mut macro_loader = DummyResolver;
+        let cx = make_ext_ctxt(&sess, &mut macro_loader);
+
+        let items = field.gen_update(&cx, &register);
+        assert_eq!(item_to_string(&items.get(1).unwrap()),
+r"#[allow(dead_code, missing_docs)]
+impl <'a> CrUpdate<'a> {
+    #[inline(always)]
+    pub fn set_rx<'b>(&'b mut self, new_value: bool) -> &'b mut CrUpdate<'a> {
+        self.value =
+            (self.value & !(1u32 << 11u32)) |
+                ((new_value as u32) & 1u32) << 11u32;
+        self.mask |= 1u32 << 11u32;
+        self
+    }
+}");
+    }
+
+    #[test]
+    fn test_field_gen_type1() {
+        let field = Field {
+            name: "RX".to_owned(),
+            description: Some("Receive enabled".to_owned()),
+            bit_range: BitRange {
+                offset: 11,
+                width: 1,
+            },
+            access: Some(Access::ReadWrite),
+            enumerated_values: None,
+        };
+
+        let builder = AstBuilder::new();
+        let ty = field.gen_type();
+        assert_eq!(ty, builder.ty().bool());
+    }
+
+    #[test]
+    fn test_field_gen_type2() {
+        let field = Field {
+            name: "RX".to_owned(),
+            description: Some("Receive enabled".to_owned()),
+            bit_range: BitRange {
+                offset: 11,
+                width: 2,
+            },
+            access: Some(Access::ReadWrite),
+            enumerated_values: None,
+        };
+
+        let builder = AstBuilder::new();
+        let ty = field.gen_type();
+        assert_eq!(ty, builder.ty().u8());
+    }
+
+    #[test]
+    fn test_field_gen_type3() {
+        let field = Field {
+            name: "PARITY".to_owned(),
+            description: Some("UART Parity".to_owned()),
+            bit_range: BitRange {
+                offset: 2,
+                width: 3,
+            },
+            access: Some(Access::ReadWrite),
+            enumerated_values: Some(
+                EnumeratedValues {
+                    name: Some("PARITY".to_owned()),
+                    usage: None,
+                    derived_from: None,
+                    values: vec![
+                        EnumeratedValue {
+                            name: "NONE".to_owned(),
+                            description: None,
+                            value: Some(0),
+                            is_default: None,
+                        },
+                        EnumeratedValue {
+                            name: "EVEN".to_owned(),
+                            description: None,
+                            value: Some(2),
+                            is_default: None,
+                        },
+                        EnumeratedValue {
+                            name: "ODD".to_owned(),
+                            description: None,
+                            value: Some(3),
+                            is_default: None,
+                        },
+                    ]}),
+        };
+
+        let builder = AstBuilder::new();
+        let ty = field.gen_type();
+        assert_eq!(ty, builder.ty().id("Parity"));
+    }
+
+    #[test]
+    fn test_field_gen_type4() {
+        let field = Field {
+            name: "RX".to_owned(),
+            description: Some("Receive enabled".to_owned()),
+            bit_range: BitRange {
+                offset: 11,
+                width: 9,
+            },
+            access: Some(Access::ReadWrite),
+            enumerated_values: None,
+        };
+
+        let builder = AstBuilder::new();
+        let ty = field.gen_type();
+        assert_eq!(ty, builder.ty().u16());
+    }
+
+    #[test]
+    fn test_field_gen_type_def1() {
+        let field = Field {
+            name: "PARITY".to_owned(),
+            description: Some("UART Parity".to_owned()),
+            bit_range: BitRange {
+                offset: 2,
+                width: 3,
+            },
+            access: Some(Access::ReadWrite),
+            enumerated_values: Some(
+                EnumeratedValues {
+                    name: Some("PARITY".to_owned()),
+                    usage: None,
+                    derived_from: None,
+                    values: vec![
+                        EnumeratedValue {
+                            name: "NONE".to_owned(),
+                            description: None,
+                            value: Some(0),
+                            is_default: None,
+                        },
+                        EnumeratedValue {
+                            name: "EVEN".to_owned(),
+                            description: None,
+                            value: Some(2),
+                            is_default: None,
+                        },
+                        EnumeratedValue {
+                            name: "ODD".to_owned(),
+                            description: None,
+                            value: Some(3),
+                            is_default: None,
+                        },
+                    ]}),
+        };
+
+        let sess = parse::ParseSess::new();
+        let mut macro_loader = DummyResolver;
+        let cx = make_ext_ctxt(&sess, &mut macro_loader);
+        let item = field.gen_type_def(&cx);
+        assert_eq!(item_to_string(&item.unwrap()),
+r"#[allow(dead_code, missing_docs)]
+enum Parity { None = 0u32, Even = 2u32, Odd = 3u32, }");
+    }
+
+    #[test]
+    fn test_field_gen_type_def2() {
+        let field = Field {
+            name: "UART_PARITY".to_owned(),
+            description: Some("UART Parity".to_owned()),
+            bit_range: BitRange {
+                offset: 2,
+                width: 3,
+            },
+            access: Some(Access::ReadWrite),
+            enumerated_values: Some(
+                EnumeratedValues {
+                    name: None,
+                    usage: None,
+                    derived_from: None,
+                    values: vec![
+                        EnumeratedValue {
+                            name: "NONE".to_owned(),
+                            description: None,
+                            value: Some(0),
+                            is_default: None,
+                        },
+                        EnumeratedValue {
+                            name: "EVEN".to_owned(),
+                            description: None,
+                            value: Some(2),
+                            is_default: None,
+                        },
+                        EnumeratedValue {
+                            name: "ODD".to_owned(),
+                            description: None,
+                            value: Some(3),
+                            is_default: None,
+                        },
+                    ]}),
+        };
+
+        let sess = parse::ParseSess::new();
+        let mut macro_loader = DummyResolver;
+        let cx = make_ext_ctxt(&sess, &mut macro_loader);
+        let item = field.gen_type_def(&cx);
+        assert_eq!(item_to_string(&item.unwrap()),
+r"#[allow(dead_code, missing_docs)]
+enum UartParity { None = 0u32, Even = 2u32, Odd = 3u32, }");
+
     }
 }
