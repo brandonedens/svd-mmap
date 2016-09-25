@@ -52,6 +52,9 @@ trait GenField {
     /// Generate the type definition for the field that has enumerated values.
     fn gen_type_def(&self, cx: &ExtCtxt) -> Option<P<syntax::ast::Item>>;
 
+    /// Generate type identifier.
+    fn gen_type_ident(&self) -> Option<ast::Ident>;
+
     /// Generate setter impl.
     fn gen_update(&self, cx: &ExtCtxt, register: &Register) -> Vec<P<syntax::ast::Item>>;
 }
@@ -107,8 +110,7 @@ impl GenField for Field {
                     .map(|x| x.value)
                     .collect::<Vec<_>>().into_iter();
 
-                let ref name = enum_vals.name.as_ref().unwrap_or(&self.name);
-                let enum_name = builder.id(name.to_pascal_case());
+                let enum_name = self.gen_type_ident().unwrap();
 
                 quote_item!(&cx,
                             #[allow(dead_code, missing_docs)]
@@ -152,9 +154,8 @@ impl GenField for Field {
     fn gen_type(&self) -> syntax::ptr::P<syntax::ast::Ty> {
         let builder = aster::AstBuilder::new();
 
-        if let Some(vals) = self.enumerated_values.as_ref() {
-            let ref name = vals.name.as_ref().unwrap_or(&self.name);
-            builder.ty().id(name.to_pascal_case())
+        if self.enumerated_values.is_some() {
+            builder.ty().id(self.gen_type_ident().unwrap())
         } else {
             match self.bit_range.width {
                 1 => builder.ty().bool(),
@@ -186,8 +187,7 @@ impl GenField for Field {
 
         let builder = aster::AstBuilder::new();
         let enum_vals = self.enumerated_values.as_ref().unwrap();
-        let ref name = enum_vals.name.as_ref().unwrap_or(&self.name);
-        let name = builder.id(name.to_pascal_case());
+        let name = self.gen_type_ident().unwrap();
 
         let keys = enum_vals.values.iter()
             .map(|x| builder.id(x.name.to_pascal_case()))
@@ -204,6 +204,22 @@ impl GenField for Field {
                              $($keys = $vals),*
                          }).unwrap())
     }
+
+    /// Generate type identifier.
+    fn gen_type_ident(&self) -> Option<ast::Ident> {
+        if let Some(enum_vals) = self.enumerated_values.as_ref() {
+            let ref name = if let Some(enum_name) = enum_vals.name.as_ref() {
+                self.name.to_owned() + "_" + enum_name
+            } else {
+                self.name.to_owned()
+            };
+            let builder = aster::AstBuilder::new();
+            Some(builder.id(name.to_pascal_case()))
+        } else {
+            None
+        }
+    }
+
 
     /// Generate struct representation of register field update in the form of:
     ///
