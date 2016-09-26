@@ -31,6 +31,8 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::prelude::*;
+use std::path::Path;
+use std::path::PathBuf;
 use svd::{Access, Device, Field, Peripheral, Register};
 use syntax::ast;
 use syntax::codemap::Span;
@@ -786,7 +788,19 @@ pub fn macro_svd_mmap(cx: &mut ExtCtxt,
         }
     };
 
-    let mut svd_file = File::open(filename).unwrap();
+    let path = Path::new(&filename);
+    let path_buf =
+        if !path.is_absolute() {
+            let call_site = cx.codemap().source_callsite(sp);
+            let mut cu = PathBuf::from(&cx.codemap().span_to_filename(call_site));
+            cu.pop();
+            cu.push(path);
+            cu
+        } else {
+            path.to_path_buf()
+        };
+
+    let mut svd_file = File::open(path_buf).unwrap();
     let mut s = String::new();
     svd_file.read_to_string(&mut s).unwrap();
 
