@@ -9,7 +9,7 @@
 
 extern crate aster;
 extern crate clap;
-extern crate svd;
+extern crate svd_parser as svd;
 #[allow(plugin_as_library)]
 extern crate svd_mmap;
 extern crate syntax;

@@ -13,7 +13,7 @@ clap = "2.13.0"
 inflections = "1.0.0"
 quasi = "*"
 quasi_macros = "*"
-svd = { git = "https://github.com/japaric/svd" }
+svd-parser = { git = "https://github.com/japaric/svd" }
 
 [dev-dependencies]
 volatile_cell = {git = "https://github.com/hackndev/zinc"}
